@@ -1,11 +1,13 @@
 """
-Sentinel-5P TROPOMI L3 (fortnight) 대류권 NO2 — 뉴질랜드 전역 분석
+Sentinel-5P TROPOMI L3 (fortnight) tropospheric NO2 — New Zealand-wide analysis
 
-입력 : 이 폴더의 s5p-l3grd-no2-tropospheric-001-fortnight-*.nc (전지구 0.022° 격자)
-출력 : output_nz/ 폴더에 그림(PNG), 통계(CSV), 뉴질랜드 영역만 잘라낸 NetCDF(캐시)
+Input  : s5p-l3grd-no2-tropospheric-001-fortnight-*.nc in this folder (global 0.022° grid)
+Output : figures (PNG), statistics (CSV) and NetCDF subsets clipped to New Zealand (cache) in output_nz/
 
-실행 : python analyze_nz_no2.py
+Run    : python analyze_nz_no2.py [--data-dir DIR] [--pattern GLOB] [--out-dir DIR]
+         e.g. python analyze_nz_no2.py --data-dir "D:/Tropomi NO2" --pattern "*season*.nc"
 """
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -19,23 +21,31 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import cartopy.io.shapereader as shpreader
 
-# ---------------------------------------------------------------- 설정
-DATA_DIR = Path(__file__).parent
-OUT_DIR = DATA_DIR / "output_nz"
-OUT_DIR.mkdir(exist_ok=True)
+# ---------------------------------------------------------------- Settings
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent,
+                    help="folder holding the global L3 NetCDF files (default: this script's folder)")
+parser.add_argument("--pattern", default="s5p-l3grd-no2-tropospheric-*fortnight*.nc",
+                    help="glob for the input files (default: fortnight files)")
+parser.add_argument("--out-dir", type=Path, default=None,
+                    help="output folder (default: <data-dir>/output_nz)")
+args = parser.parse_args()
+DATA_DIR = args.data_dir
+OUT_DIR = args.out_dir or DATA_DIR / "output_nz"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 뉴질랜드 본토 (채텀 제도 제외)
+# New Zealand mainland (excluding the Chatham Islands)
 LAT_MIN, LAT_MAX = -47.6, -34.0
 LON_MIN, LON_MAX = 166.0, 179.0
 
-URBAN_RADIUS_KM = 10      # 도시 영역 반경
-BG_RADIUS_KM = (40, 80)   # 지역 배경 고리
-SITE_HALF_WIN = 1         # 지점 값 = 3x3 픽셀(약 7 km) 평균
-# 품질 필터: 2주 동안 유효 관측 가중치가 이보다 작은 픽셀은 제외
-# (예: 8월 서던 알프스 적설 지역에서 weight≈1, NO2 140~160 µmol/m² 의 이상값)
+URBAN_RADIUS_KM = 10      # urban area radius
+BG_RADIUS_KM = (40, 80)   # regional background ring
+SITE_HALF_WIN = 1         # site value = mean of 3x3 pixels (~7 km)
+# Quality filter: exclude pixels whose valid-observation weight over the fortnight is below this
+# (e.g. snow-covered Southern Alps in August: weight≈1, outliers of 140–160 µmol/m² NO2)
 MIN_WEIGHT = 2.0
 
-# 이름: (lat, lon, 유형)
+# name: (lat, lon, type)
 SITES = {
     "Auckland": (-36.848, 174.763, "city"),
     "Hamilton": (-37.787, 175.279, "city"),
@@ -57,14 +67,14 @@ SITES = {
     "Tiwai Point smelter": (-46.590, 168.380, "industrial"),
 }
 LABELS_LEFT = {"Hamilton"}
-# 확대 지도에 쓸 도시 (중심, 반폭 deg)
+# Cities for the zoomed maps (centre, half-width in deg)
 ZOOM_CITIES = ["Auckland", "Hamilton", "Wellington", "Christchurch"]
 ZOOM_HALF = 0.45
 
 UMOL_M2_TO_1E15_MOLEC_CM2 = 6.02214076e23 * 1e-6 / 1e4 / 1e15  # = 0.0602
 
-# 차트 색 (dataviz 레퍼런스 팔레트)
-PERIOD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]  # 기간 1~3 고정 순서
+# Chart colours (dataviz reference palette)
+PERIOD_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]  # fixed order for periods 1–5
 SEQ = LinearSegmentedColormap.from_list(
     "seq_blue", ["#f4f8fe", "#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5",
                  "#256abf", "#184f95", "#0d366b"])
@@ -74,7 +84,7 @@ DIV = LinearSegmentedColormap.from_list(
 INK, INK2, MUTED, GRID = "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
 
 plt.rcParams.update({
-    "font.family": ["Malgun Gothic", "DejaVu Sans"],
+    "font.family": ["DejaVu Sans"],
     "axes.unicode_minus": False,
     "figure.dpi": 110, "savefig.dpi": 160,
     "axes.edgecolor": "#c3c2b7", "axes.labelcolor": INK2,
@@ -85,9 +95,9 @@ plt.rcParams.update({
 })
 
 
-# ---------------------------------------------------------------- 데이터 로드
+# ---------------------------------------------------------------- Data loading
 def load_period(nc_path: Path) -> xr.Dataset:
-    """전지구 파일에서 뉴질랜드 영역만 잘라 캐시(output_nz/subset_*.nc)로 저장."""
+    """Clip the New Zealand domain from a global file and cache it (output_nz/subset_*.nc)."""
     cache = OUT_DIR / f"subset_{nc_path.stem}.nc"
     if cache.exists():
         return xr.open_dataset(cache)
@@ -109,7 +119,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def land_mask(lat, lon):
-    """Natural Earth 10m 육지 폴리곤으로 격자 육지 마스크 생성."""
+    """Build a grid land mask from the Natural Earth 10m land polygons."""
     bbox = box(LON_MIN, LAT_MIN, LON_MAX, LAT_MAX)
     geoms = [g.intersection(bbox) for g in shpreader.Reader(
         shpreader.natural_earth("10m", "physical", "land")).geometries()
@@ -119,29 +129,41 @@ def land_mask(lat, lon):
     return shapely.contains_xy(land, lon2, lat2)
 
 
-files = sorted(DATA_DIR.glob("s5p-l3grd-no2-tropospheric-*fortnight*.nc"))
+# Raw files, plus periods available only as a cached subset (raw file no longer on disk)
+names = ({f.name for f in DATA_DIR.glob(args.pattern)}
+         | {c.name.removeprefix("subset_") for c in OUT_DIR.glob("subset_" + args.pattern)})
+files = [DATA_DIR / n for n in sorted(names)]
 if not files:
-    raise SystemExit("NetCDF 파일을 찾을 수 없습니다.")
+    raise SystemExit("No NetCDF files found.")
+if len(files) > len(PERIOD_COLORS):
+    raise SystemExit(f"At most {len(PERIOD_COLORS)} periods are supported, found {len(files)}.")
 
 periods = []
 for f in files:
-    print(f"읽는 중: {f.name}")
+    print(f"Reading: {f.name}")
     ds = load_period(f)
     low = ds.weight < MIN_WEIGHT
-    print(f"  품질 필터: weight < {MIN_WEIGHT} 픽셀 {int(low.sum())}개 "
-          f"({float(low.mean()) * 100:.1f}%) 제외")
+    print(f"  Quality filter: excluded {int(low.sum())} pixels with weight < {MIN_WEIGHT} "
+          f"({float(low.mean()) * 100:.1f}%)")
     ds["no2"] = ds.no2.where(~low)
     ds["no2_unc"] = ds.no2_unc.where(~low)
     t0 = pd.Timestamp(ds.datetime_start.values.item())
     t1 = pd.Timestamp(ds.datetime_stop.values.item())
-    periods.append({"ds": ds, "start": t0, "stop": t1, "label": f"{t0:%m/%d}–{t1:%m/%d}"})
+    periods.append({"ds": ds, "start": t0, "stop": t1})
+# Include the year in labels when the periods span more than one year
+fmt = "%m/%d" if len({t.year for p in periods for t in (p["start"], p["stop"])}) == 1 else "%Y/%m/%d"
+for p in periods:
+    p["label"] = f"{p['start']:{fmt}}–{p['stop']:{fmt}}"
 order = [p["label"] for p in periods]
+NP = len(periods)
+# Composite name for titles, from the mean period length (~14 days vs ~3 months)
+COMPOSITE = "seasonal" if np.mean([(p["stop"] - p["start"]).days for p in periods]) > 40 else "fortnightly"
 
 lat = periods[0]["ds"].latitude.values
 lon = periods[0]["ds"].longitude.values
 LON2, LAT2 = np.meshgrid(lon, lat)
 LAND = land_mask(lat, lon)
-print(f"격자 {lat.size} x {lon.size}, 육지 픽셀 {LAND.mean() * 100:.1f}%")
+print(f"Grid {lat.size} x {lon.size}, land pixels {LAND.mean() * 100:.1f}%")
 
 
 def site_value(arr, la, lo):
@@ -151,13 +173,13 @@ def site_value(arr, la, lo):
     return float(np.nanmean(arr[i - w:i + w + 1, j - w:j + w + 1]))
 
 
-# ---------------------------------------------------------------- 통계
+# ---------------------------------------------------------------- Statistics
 period_rows, site_rows = [], []
 site_dist = {name: haversine_km(la, lo, LAT2, LON2) for name, (la, lo, _) in SITES.items()}
 for p in periods:
     no2 = p["ds"].no2.values
     unc = p["ds"].no2_unc.values
-    north = LAND & (LAT2 > -40.6) & (LON2 > 172.6)     # 북섬 (대략)
+    north = LAND & (LAT2 > -40.6) & (LON2 > 172.6)     # North Island (approx.)
     south = LAND & ~north
     period_rows.append({
         "period": p["label"], "start": p["start"].date(), "stop": p["stop"].date(),
@@ -189,17 +211,18 @@ sites_df.to_csv(OUT_DIR / "site_values.csv", index=False, encoding="utf-8-sig")
 
 pd.set_option("display.width", 200, "display.max_columns", 30,
               "display.float_format", "{:.2f}".format)
-print("\n=== 기간별 통계 (µmol/m²) ===")
+print("\n=== Statistics by period (µmol/m²) ===")
 print(stats.set_index("period").T)
-print("\n=== 지점별 NO2 (µmol/m², 3x3 픽셀 평균) ===")
+print("\n=== NO2 by site (µmol/m², 3x3 pixel mean) ===")
 print(sites_df.pivot(index="site", columns="period", values="no2_umol_m2")
       .reindex(SITES.keys()))
-print(f"\n=== 도시 증강량 = 반경 {URBAN_RADIUS_KM} km 평균 - {BG_RADIUS_KM[0]}–{BG_RADIUS_KM[1]} km 배경 ===")
+print(f"\n=== Urban enhancement = mean within {URBAN_RADIUS_KM} km - "
+      f"{BG_RADIUS_KM[0]}–{BG_RADIUS_KM[1]} km background ===")
 print(sites_df.pivot(index="site", columns="period", values="enhancement")
       .reindex(SITES.keys()))
 
 
-# ---------------------------------------------------------------- 그림 공통
+# ---------------------------------------------------------------- Shared figure helpers
 def map_axes(fig, pos, extent=(LON_MIN, LON_MAX, LAT_MIN, LAT_MAX)):
     ax = fig.add_subplot(*pos, projection=ccrs.PlateCarree())
     ax.set_extent(extent, crs=ccrs.PlateCarree())
@@ -213,7 +236,7 @@ def decorate(ax, labels=False, grid=True, fs=7):
         ax.plot(lo, la, mk, ms=4, mfc="white", mec=INK, mew=0.8,
                 transform=ccrs.PlateCarree(), zorder=5)
         if labels and kind == "city":
-            left = name in LABELS_LEFT  # 옆 도시와 겹치는 라벨은 왼쪽에
+            left = name in LABELS_LEFT  # put labels that overlap a neighbouring city on the left
             ax.text(lo - 0.15 if left else lo + 0.15, la, name, fontsize=fs, color=INK,
                     va="center", ha="right" if left else "left",
                     transform=ccrs.PlateCarree(), zorder=6, clip_on=True,
@@ -224,11 +247,11 @@ def decorate(ax, labels=False, grid=True, fs=7):
         gl.xlabel_style = gl.ylabel_style = {"size": 7, "color": MUTED}
 
 
-# ---------------------------------------------------------------- 1) 전국 지도 (기간별)
-# 배경 값이 낮고 도시만 튀므로 제곱근 스케일(PowerNorm 0.5)로 표시
+# ---------------------------------------------------------------- 1) National maps (per period)
+# Background values are low and only cities stand out, so use a square-root scale (PowerNorm 0.5)
 vmax = np.nanpercentile(np.concatenate([p["ds"].no2.values[LAND] for p in periods]), 99.9)
 norm = PowerNorm(0.5, vmin=0, vmax=vmax, clip=True)
-fig = plt.figure(figsize=(18, 6.4))
+fig = plt.figure(figsize=(6 * NP, 6.4))
 for k, p in enumerate(periods):
     ax = map_axes(fig, (1, len(periods), k + 1))
     im = ax.pcolormesh(lon, lat, p["ds"].no2.values, cmap=SEQ, norm=norm,
@@ -236,12 +259,12 @@ for k, p in enumerate(periods):
     decorate(ax, labels=(k == 0))
     ax.set_title(f"{p['start']:%Y-%m-%d} ~ {p['stop']:%Y-%m-%d}", fontsize=12)
 cb = fig.colorbar(im, ax=fig.axes, orientation="horizontal", fraction=0.04, pad=0.06, shrink=0.45)
-cb.set_label("대류권 NO$_2$ 칼럼 (µmol/m², 제곱근 스케일)  ○ 도시  △ 산업시설")
-fig.suptitle("뉴질랜드 대류권 NO$_2$ — TROPOMI 2주 평균", fontsize=15, y=1.0)
+cb.set_label("Tropospheric NO$_2$ column (µmol/m², square-root scale)  ○ city  △ industrial site")
+fig.suptitle(f"New Zealand tropospheric NO$_2$ — TROPOMI {COMPOSITE} mean", fontsize=15, y=1.0)
 fig.savefig(OUT_DIR / "01_nz_no2_maps.png", bbox_inches="tight")
 plt.close(fig)
 
-# ---------------------------------------------------------------- 2) 변화 지도 (마지막 - 첫 기간)
+# ---------------------------------------------------------------- 2) Change map (last - first period)
 first, last = periods[0], periods[-1]
 diff = last["ds"].no2.values - first["ds"].no2.values
 lim = np.nanpercentile(np.abs(diff[LAND]), 99.5)
@@ -252,14 +275,14 @@ im = ax.pcolormesh(lon, lat, diff, cmap=DIV, norm=TwoSlopeNorm(0, -lim, lim),
 decorate(ax, labels=True)
 cb = fig.colorbar(im, ax=ax, orientation="horizontal", fraction=0.04, pad=0.06)
 cb.set_label("ΔNO$_2$ (µmol/m²)")
-ax.set_title(f"NO$_2$ 변화: ({last['label']}) - ({first['label']})\n빨강 = 증가, 파랑 = 감소",
+ax.set_title(f"NO$_2$ change: ({last['label']}) - ({first['label']})\nred = increase, blue = decrease",
              fontsize=12)
 fig.savefig(OUT_DIR / "02_nz_difference.png", bbox_inches="tight")
 plt.close(fig)
 
-# ---------------------------------------------------------------- 3) 도시·시설별 증강량 (가로 막대)
+# ---------------------------------------------------------------- 3) Enhancement by city/site (horizontal bars)
 enh = (sites_df.pivot(index="site", columns="period", values="enhancement")[order])
-enh = enh.loc[enh.mean(axis=1).sort_values().index]   # 평균 증강량 순 정렬
+enh = enh.loc[enh.mean(axis=1).sort_values().index]   # sort by mean enhancement
 fig, ax = plt.subplots(figsize=(10, 9))
 n = len(order)
 bh = 0.8 / n
@@ -271,15 +294,15 @@ names = [f"{s}  △" if SITES[s][2] == "industrial" else s for s in enh.index]
 ax.set_yticks(y, names, fontsize=9)
 ax.axvline(0, color="#c3c2b7", lw=1)
 ax.grid(axis="y", visible=False)
-ax.set_xlabel(f"NO$_2$ 증강량 (µmol/m²) = 반경 {URBAN_RADIUS_KM} km 평균 - "
-              f"{BG_RADIUS_KM[0]}–{BG_RADIUS_KM[1]} km 배경")
-ax.legend(title="기간", frameon=False, loc="lower right")
-ax.set_title("도시·산업시설별 NO$_2$ 증강량 (△ = 산업시설)", loc="left", fontsize=13)
+ax.set_xlabel(f"NO$_2$ enhancement (µmol/m²) = mean within {URBAN_RADIUS_KM} km - "
+              f"{BG_RADIUS_KM[0]}–{BG_RADIUS_KM[1]} km background")
+ax.legend(title="Period", frameon=False, loc="lower right")
+ax.set_title("NO$_2$ enhancement by city and industrial site (△ = industrial)", loc="left", fontsize=13)
 fig.savefig(OUT_DIR / "03_site_enhancement.png", bbox_inches="tight")
 plt.close(fig)
 
-# ---------------------------------------------------------------- 4) 주요 도시 확대 지도 (도시 x 기간)
-fig = plt.figure(figsize=(13, 3.3 * len(ZOOM_CITIES)))
+# ---------------------------------------------------------------- 4) Zoomed maps of major cities (city x period)
+fig = plt.figure(figsize=(13 / 3 * NP, 3.3 * len(ZOOM_CITIES)))
 zvmax = 0
 panels = []
 for r, city in enumerate(ZOOM_CITIES):
@@ -294,11 +317,11 @@ for r, city in enumerate(ZOOM_CITIES):
         ax.set_title(f"{city}  |  {p['label']}", fontsize=10)
 fig.subplots_adjust(right=0.9, hspace=0.15, wspace=0.05)
 fig.colorbar(im, cax=fig.add_axes([0.92, 0.3, 0.012, 0.4]), label="NO$_2$ (µmol/m²)")
-fig.suptitle("주요 도시 확대 (약 100 km × 100 km, 공통 색 범위 0–35)", fontsize=14, y=0.93)
+fig.suptitle("Major cities zoomed in (~100 km × 100 km, common colour range 0–35)", fontsize=14, y=0.93)
 fig.savefig(OUT_DIR / "04_city_zoom.png", bbox_inches="tight")
 plt.close(fig)
 
-# ---------------------------------------------------------------- 5) 위도별 육지 평균 프로파일
+# ---------------------------------------------------------------- 5) Land-mean profile by latitude
 lat_bins = np.arange(-47.5, -33.99, 0.5)
 lat_mid = (lat_bins[:-1] + lat_bins[1:]) / 2
 fig, ax = plt.subplots(figsize=(6.5, 8))
@@ -313,28 +336,28 @@ for name in ["Auckland", "Hamilton", "Wellington", "Christchurch", "Dunedin", "I
     ax.axhline(SITES[name][0], color=GRID, lw=0.8, zorder=0)
     ax.text(ax.get_xlim()[1], SITES[name][0], f" {name}", va="center", fontsize=8, color=MUTED)
 ax.axhspan(-41.8, -40.4, color="#f6f6f3", zorder=0)
-ax.text(ax.get_xlim()[0], -41.1, " 쿡 해협", va="center", fontsize=8, color=MUTED)
-ax.set_xlabel("육지 평균 NO$_2$ (µmol/m²)")
-ax.set_ylabel("위도 (°)")
-ax.legend(frameon=False, title="기간", loc="lower right")
-ax.set_title("위도 0.5° 구간별 육지 평균 NO$_2$", loc="left", fontsize=12)
+ax.text(ax.get_xlim()[0], -41.1, " Cook Strait", va="center", fontsize=8, color=MUTED)
+ax.set_xlabel("Land-mean NO$_2$ (µmol/m²)")
+ax.set_ylabel("Latitude (°)")
+ax.legend(frameon=False, title="Period", loc="lower right")
+ax.set_title("Land-mean NO$_2$ in 0.5° latitude bands", loc="left", fontsize=12)
 fig.savefig(OUT_DIR / "05_latitude_profile.png", bbox_inches="tight")
 plt.close(fig)
 
-# ---------------------------------------------------------------- 6) 데이터 품질: 관측 가중치
-fig = plt.figure(figsize=(18, 6.4))
+# ---------------------------------------------------------------- 6) Data quality: observation weight
+fig = plt.figure(figsize=(6 * NP, 6.4))
 wmax = max(np.nanmax(p["ds"].weight.values) for p in periods)
 for k, p in enumerate(periods):
     ax = map_axes(fig, (1, len(periods), k + 1))
     im = ax.pcolormesh(lon, lat, p["ds"].weight.values, cmap=SEQ, vmin=0, vmax=wmax,
                        shading="nearest", transform=ccrs.PlateCarree(), rasterized=True)
     decorate(ax)
-    ax.set_title(f"{p['label']}  관측 가중치", fontsize=11)
+    ax.set_title(f"{p['label']}  observation weight", fontsize=11)
 cb = fig.colorbar(im, ax=fig.axes, orientation="horizontal", fraction=0.04, pad=0.06, shrink=0.45)
-cb.set_label("weight (유효 관측이 많을수록 큼) — 구름이 잦은 서해안·산지는 값이 낮음")
-fig.suptitle(f"데이터 품질 — weight < {MIN_WEIGHT:g} 픽셀은 분석에서 제외(다른 지도에서 공백)",
-             fontsize=14, y=1.0)
+cb.set_label("weight (higher = more valid observations) — low over the often-cloudy west coast and mountains")
+fig.suptitle(f"Data quality — pixels with weight < {MIN_WEIGHT:g} are excluded from the analysis "
+             "(blank in other maps)", fontsize=14, y=1.0)
 fig.savefig(OUT_DIR / "06_nz_data_quality.png", bbox_inches="tight")
 plt.close(fig)
 
-print(f"\n완료. 결과 저장 위치: {OUT_DIR}")
+print(f"\nDone. Results saved to: {OUT_DIR}")
